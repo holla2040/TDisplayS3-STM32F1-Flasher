@@ -7,6 +7,7 @@
 #include <FFat.h>
 #include <Update.h>
 #include <TFT_eSPI.h>
+#include <esp_rom_crc.h>
 
 #include "config.h"
 #include "swd.h"
@@ -28,11 +29,17 @@ static File uploadFile;
 
 alignas(4) static uint8_t image[64 * 1024];   // Bluepill: STM32F103C8, 64 KB flash
 static size_t imageLen = 0;
+static uint32_t imageCrc = 0;   // CRC32 of the image bytes: matches `crc32 app.bin` / Python zlib.crc32
 static uint32_t passCount = 0, failCount = 0;
 
-// Auto mode flashes once per insertion: set once a flash reaches a verdict,
-// cleared when the target disconnects. Comm errors leave it clear (retry).
+// Auto mode flashes once per insertion: set after every attempt (PASS, FAIL,
+// skipped, or comm error), cleared when the target disconnects. A comm-error
+// board is NOT retried while it stays seated: every retry rewrites flash.
 static bool flashed = false;
+
+// Last verdict, shown on the home screen until the board is removed.
+static char lastResult[16] = "";
+static uint16_t lastBg = TFT_BLACK;
 
 // WiFi is secondary: the jig flashes with or without it. WiFiManager runs
 // non-blocking; OTA + mDNS start whenever a connection eventually appears.
@@ -48,16 +55,18 @@ static void showHome() {
   tft.setCursor(0, 0, 2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(2);
-  // live detection
-  tft.println(detected);
+  tft.println(detected);                    // live detection
   if (imageLen) tft.printf("image %u\n", (unsigned)imageLen);
-  else tft.println("no image: browse to");
+  else tft.println("no image loaded");
   tft.printf("pass %lu fail %lu\n", passCount, failCount);
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  // tft.println(autoMode ? "waiting for target..." : "press button to flash");
+  if (lastResult[0]) {
+    tft.setTextColor(TFT_WHITE, lastBg);
+    tft.printf(" %s ", lastResult);
+  }
+  tft.setCursor(0, 4 * 32, 2);
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  if (netUp) tft.println(WiFi.localIP());
-  else tft.println("wifi: setup AP " PROJECTNAME);
+  if (WiFi.status() == WL_CONNECTED) tft.print(WiFi.localIP());
+  else tft.print(wifiManager.getConfigPortalActive() ? "AP: " PROJECTNAME : "wifi: connecting");
 
   // ponytail: mode letter hidden — the enclosure has no button access, so the
   // jig always runs auto. Toggle code stays; re-enable this if buttons return.
@@ -88,6 +97,8 @@ static void showResult(const char *word, uint16_t bg, const char *stage) {
   tft.setTextColor(TFT_WHITE, bg);
   tft.printf(" %s %s ", word, stage);
   Serial.printf("%s: %s\n", word, stage);
+  strlcpy(lastResult, word, sizeof(lastResult));
+  lastBg = bg;
   uint32_t start = millis();
   while (millis() - start < RESULT_HOLD_MS) {
     if (!digitalRead(FLASH_BUTTON)) {
@@ -100,9 +111,11 @@ static void showResult(const char *word, uint16_t bg, const char *stage) {
 }
 
 // Load an uploaded image from FFat into the RAM buffer: Intel HEX if it
-// starts with ':', otherwise a raw .bin linked at 0x08000000 (what an
-// Arduino STM32 build produces). Either way the vector table must look like
-// an STM32F1 app — catches a wrong file (e.g. this flasher's own .ino.bin).
+// starts with ':', otherwise a raw .bin that must be linked at 0x08000000.
+// Either way the vector table must look like an STM32F1 app — catches an
+// obviously wrong file (e.g. this flasher's own .ino.bin). A .bin carries no
+// address, so one linked above 0x08000000 (for a USB bootloader) can still
+// pass; a HEX file can't, which is why HEX is the safer format.
 // On failure the buffer is trashed — caller must reload.
 static bool loadImage(const char *path) {
   File f = FFat.open(path);
@@ -132,6 +145,7 @@ static bool loadImage(const char *path) {
     return false;
   }
   imageLen = n;
+  imageCrc = esp_rom_crc32_le(0, image, n);
   return true;
 }
 
@@ -141,11 +155,11 @@ static void handleRoot() {
 
 static void handleStatus() {
   static String md5 = ESP.getSketchMD5();   // lets the page confirm a firmware update took
-  char json[256];
+  char json[320];
   snprintf(json, sizeof(json),
-    "{\"detected\":\"%s\",\"image\":%u,\"pass\":%lu,\"fail\":%lu,\"auto\":%s,"
+    "{\"detected\":\"%s\",\"image\":%u,\"crc\":\"%08lx\",\"pass\":%lu,\"fail\":%lu,\"auto\":%s,"
     "\"build\":\"" __DATE__ " " __TIME__ "\",\"md5\":\"%s\"}",
-    detected, (unsigned)imageLen, passCount, failCount, autoMode ? "true" : "false", md5.c_str());
+    detected, (unsigned)imageLen, imageCrc, passCount, failCount, autoMode ? "true" : "false", md5.c_str());
   server.send(200, "application/json", json);
 }
 
@@ -198,7 +212,7 @@ static void handleUploadDone() {
   if (!loadImage(UPLOAD_TMP)) {
     FFat.remove(UPLOAD_TMP);
     if (!loadImage(IMAGE_PATH)) imageLen = 0;   // restore previous image to RAM
-    server.send(400, "text/plain", "That file isn't an STM32F1 firmware image (.bin or Intel HEX). The previous target image is still loaded.\n");
+    server.send(400, "text/plain", "That file isn't an STM32F1 firmware image linked at 0x08000000 (.bin or Intel HEX, 64 KB max). The previous target image is still loaded.\n");
     return;
   }
   FFat.remove(IMAGE_PATH);
@@ -236,8 +250,13 @@ static bool flashCycle() {
   tft.setCursor(0, LINE_H, 2);
   tft.print(detected);
 
-  if (stm32_locked()) {   // RDP: reads blocked, page erase refused. Not a verify FAIL.
-    showResult("locked", TFT_ORANGE, "RDP: make unlock");
+  // Boards the jig won't touch get an orange notice, never a FAIL.
+  if (const char *why = stm32_refusal()) {   // "locked" (RDP set) or "unsupported"
+    showResult(why, TFT_ORANGE, "skipped");
+    return true;
+  }
+  if (imageLen > stm32_flash_size()) {
+    showResult("too big", TFT_ORANGE, "for chip");
     return true;
   }
   if (!stm32_connect()) {
@@ -266,22 +285,22 @@ static bool flashCycle() {
 // One verdicted flash: up to 3 flashCycle attempts (each re-attaches) on comm
 // errors. If no attempt reaches a verdict, show an orange notice — NOT a red
 // FAIL (that's reserved for verify mismatch) — instead of silently going home.
-static bool flashWithRetry() {
+static void flashWithRetry() {
   for (int attempt = 1; attempt <= 3; attempt++) {
-    if (flashCycle()) return true;
+    if (flashCycle()) return;
     Serial.printf("flash: comm error, attempt %d/3\n", attempt);
   }
   showResult("comm error", TFT_ORANGE, "no verdict");
-  return false;
 }
 
 // Flash, honor retest presses during the result hold, then home.
 static void runTests() {
-  flashed = flashWithRetry();
+  flashWithRetry();
   while (wantRetest) {
     wantRetest = false;
-    flashed = flashWithRetry();
+    flashWithRetry();
   }
+  flashed = true;   // whatever the outcome: no retry until the board is reseated
   showHome();
 }
 
@@ -317,10 +336,6 @@ void setup() {
   tft.init();
   tft.setRotation(3);
 
-  if (!digitalRead(MODE_BUTTON)) {
-    Serial.println("wifiManager reset");
-    wifiManager.resetSettings();
-  }
   wifiManager.setConfigPortalBlocking(false);
   wifiManager.autoConnect(PROJECTNAME);    // returns immediately; flashing never waits on wifi
 
@@ -353,26 +368,38 @@ void loop() {
     return;
   }
 
-  // Button edges (buttons idle high), 200 ms debounce lockout
-  static bool modePrev = HIGH, flashPrev = HIGH;
-  static uint32_t lastEdge = 0;
-  bool modeNow = digitalRead(MODE_BUTTON);
+  // Buttons idle high. KEY: press edge, 200 ms lockout. BOOT acts on hold
+  // time: a short press (< 1 s) toggles auto/manual on release; held 5 s it
+  // forgets WiFi and reboots into the setup AP. (BOOT can't be read at
+  // power-up: holding it then puts the ESP32-S3 into ROM download mode.)
+  static bool flashPrev = HIGH;
+  static uint32_t lastEdge = 0, modeDown = 0;
   bool flashNow = digitalRead(FLASH_BUTTON);
-  bool modePressed = (modeNow == LOW && modePrev == HIGH);
-  bool flashPressed = (flashNow == LOW && flashPrev == HIGH);
-  modePrev = modeNow;
+  bool flashPressed = flashNow == LOW && flashPrev == HIGH && millis() - lastEdge >= 200;
   flashPrev = flashNow;
-  if (millis() - lastEdge < 200) {
-    modePressed = flashPressed = false;
-  } else if (modePressed || flashPressed) {
-    lastEdge = millis();
-  }
+  if (flashPressed) lastEdge = millis();
 
-  if (modePressed) {
-    autoMode = !autoMode;
-    Serial.printf("mode: %s\n", autoMode ? "auto" : "manual");
-    showHome();
-    return;
+  if (!digitalRead(MODE_BUTTON)) {
+    if (!modeDown) modeDown = millis();
+    else if (millis() - modeDown > 5000) {
+      Serial.println("wifiManager reset");
+      tft.fillScreen(TFT_BLACK);
+      tft.setCursor(0, 0, 2);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.print("wifi forgotten");
+      wifiManager.resetSettings();
+      delay(1000);
+      ESP.restart();
+    }
+  } else if (modeDown) {
+    uint32_t held = millis() - modeDown;
+    modeDown = 0;
+    if (held >= 50 && held < 1000) {
+      autoMode = !autoMode;
+      Serial.printf("mode: %s\n", autoMode ? "auto" : "manual");
+      showHome();
+      return;
+    }
   }
 
   // Manual test: press = probe + flash right now.
@@ -401,6 +428,7 @@ void loop() {
   strcpy(prev, detected);
   if (!probe()) {
     flashed = false;     // next insertion gets flashed
+    lastResult[0] = 0;   // verdict was for the board just removed
   } else if (autoMode && imageLen && !flashed) {
     runTests();
     return;

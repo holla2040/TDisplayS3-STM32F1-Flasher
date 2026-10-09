@@ -8,9 +8,13 @@
 typedef void (*stm32_progress_t)(size_t done, size_t total);
 
 // Non-intrusive: attach, identify, detach; the target keeps running. Returns
-// "no target" or e.g. "STM32F103 64K". Also latches stm32_locked().
+// "no target" or e.g. "STM32F103 64K". Also latches the two calls below.
 const char *stm32_probe();
-bool stm32_locked();                                  // RDP set at the last probe
+// Why the jig must not flash the last probed chip: "locked" (RDP set),
+// "unsupported" (not an F103 low/medium-density part, i.e. not 1 KB pages),
+// or nullptr when it's fine to flash.
+const char *stm32_refusal();
+size_t stm32_flash_size();                            // bytes, from the chip's flash-size register
 bool stm32_connect();                                 // attach + reset-halt (SYSRESETREQ)
 // Erases only the pages the image covers: the EEPROM-emulation pages at the
 // top of flash (e.g. the Arduino EEPROM library) survive a reflash.

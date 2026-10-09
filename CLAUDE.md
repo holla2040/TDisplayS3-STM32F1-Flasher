@@ -24,12 +24,16 @@ via the Bluepill's 4-pin SWD header. Ported from TDisplayS3-STM8S-Flasher
 - Erase only the pages the image covers: EEPROM-emulation data at the top of flash must survive. NO mass erase.
 - No NRST on the SWD header: reset = SYSRESETREQ + DEMCR vector catch.
 - Probe is non-intrusive (no halt, no reset), once a second in both modes.
-- FAIL = verify mismatch only; comm errors retry 3x then an orange notice. RDP-locked = orange "locked", counts as handled (no retry loop).
-- Auto mode flashes once per insertion; WiFi never blocks flashing.
+- FAIL = verify mismatch only; comm errors retry 3x then an orange notice. Boards the jig won't touch get an orange notice too (stm32_refusal: "locked" = RDP, "unsupported" = not dev 0x410/0x412; "too big" = image > chip flash).
+- Auto mode flashes once per insertion: `flashed` is set after ANY outcome (comm error included) and cleared on disconnect, so a seated board is never reflashed.
+- The last result word stays on the home screen (line 4) until the board is removed.
+- MODE_BUTTON (GPIO0): short press toggles auto/manual, held 5 s forgets WiFi. It can't be read at power-up (boot strap). Mode letter is hidden: enclosure has no buttons.
+- WiFi never blocks flashing.
+- flashing-shop.md is a local, untracked note (.gitignore).
 
 ## Caveats
 
 - Verified on a Bluepill (2026-10-09): probe, reset-halt, program, verify PASS. SWD at ~1–2 MHz; if ACKs are flaky on the cable, raise SWD_HALF_PERIOD.
 - Flash programming writes halfwords straight through the AHB-AP and relies on WAIT while the FPEC is busy (same as Black Magic Probe's stm32f1 driver); no RAM loader.
-- PAGE is 1 KB (low/medium density). A 2 KB-page part would need it changed.
+- PAGE is 1 KB (low/medium density); other parts are refused at probe time.
 - If the target firmware remaps PA13/PA14 away from SWD, the jig can't attach (no NRST for connect-under-reset).

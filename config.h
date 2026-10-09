@@ -11,5 +11,5 @@
 #define SWD_HALF_PERIOD 60
 
 // T-Display S3 user buttons (per LilyGO schematic: BOOT=IO0, KEY=IO14)
-#define MODE_BUTTON     0   // toggle auto/manual; hold at boot to reset WiFi
+#define MODE_BUTTON     0   // short press: toggle auto/manual; hold 5 s: forget WiFi
 #define FLASH_BUTTON    14  // manual mode: press to flash

@@ -1,31 +1,36 @@
 .DEFAULT_GOAL := bin
-ip=STM32Flasher.local
+ip ?= STM32Flasher.local
 port ?= /dev/ttyACM0
-BIN := $(wildcard /tmp/arduino-build-stm32/*.ino.bin)
+BUILD := /tmp/arduino-build-stm32
+BIN := $(wildcard $(BUILD)/*.ino.bin)
+# T-Display S3: 16MB flash, OPI PSRAM (per Xinyuan-LilyGO/T-Display-S3 README)
+FQBN := esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi
+ESPOTA ?= $(HOME)/.arduino15/packages/esp32/hardware/esp32/3.3.0/tools/espota.py
 
-
-# Push a target image (.bin or .hex) to the running flasher, e.g.:
-#   make image IMG=path/to/app.ino.bin
+# Push a target image (.hex or .bin) to the running flasher, e.g.:
+#   make image IMG=path/to/app.hex
 image:
 	curl -f -F 'image=@$(IMG)' http://$(ip)/upload
 
-# T-Display S3: 16MB flash, OPI PSRAM (per Xinyuan-LilyGO/T-Display-S3 README)
 bin:
-	@ arduino-cli compile --build-path /tmp/arduino-build-stm32 -b esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi .
+	@ arduino-cli compile --build-path $(BUILD) -b $(FQBN) .
 
+# "flash" here means updating the jig itself over WiFi, not the target.
+flash: ota
 
-flash:
-	make ota
+usb: serial
 
-usb:
-	make serial
-
+# Frees the port if a microcom session holds it, then uploads over USB.
 serial:
-	- pkill -9 -f microcom
-	arduino-cli upload -p $(port) --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc /tmp/arduino-build-stm32 --input-dir /tmp/arduino-build-stm32
-
-clean:
-	rm -rf /tmp/arduino-build-stm32
+	- pkill -f "microcom.*$(port)"
+	arduino-cli upload -p $(port) --fqbn $(FQBN) --input-dir $(BUILD) .
 
 ota:
-	python3 "/home/holla/.arduino15/packages/esp32/hardware/esp32/3.3.0/tools/espota.py" -r -i $(ip) -p 3232 --auth=admin -f "$(BIN)"
+	python3 "$(ESPOTA)" -r -i $(ip) -p 3232 -f "$(BIN)"
+
+# Host-side check of the Intel HEX parser (gcc only, no hardware)
+test:
+	cp test_ihx.c.txt $(BUILD)-test_ihx.c && gcc -x c $(BUILD)-test_ihx.c ihx.cpp -I. -o $(BUILD)-test_ihx && $(BUILD)-test_ihx
+
+clean:
+	rm -rf $(BUILD)

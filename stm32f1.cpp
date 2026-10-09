@@ -17,7 +17,8 @@
 #define CR_STRT 0x40
 #define CR_LOCK 0x80
 #define OBR_RDPRT 0x02
-// ponytail: 1 KB pages = low/medium density (F103C8/CB). High density is 2 KB.
+// 1 KB pages = low/medium density (dev 0x412/0x410). Other parts are refused
+// at probe time (stm32_refusal), since 2 KB pages would corrupt on erase.
 #define PAGE 1024
 
 // Cortex-M3 debug / system control
@@ -34,7 +35,8 @@
 #define DBGMCU_IDCODE 0xE0042000
 #define FLASH_SIZE_KB 0x1FFFF7E0   // 16-bit, in the low half of the word
 
-static bool rdp = false;
+static const char *refusal = nullptr;
+static size_t flashBytes = 0;
 
 const char *stm32_probe() {
   static char name[32];
@@ -43,15 +45,19 @@ const char *stm32_probe() {
       !swd_read32(FLASH_SIZE_KB, &kb) || !swd_read32(FLASH_OBR, &obr))
     return "no target";
   swd_disconnect();
-  rdp = obr & OBR_RDPRT;
   dev &= 0xFFF;
   kb &= 0xFFFF;
-  if (dev == 0x410) snprintf(name, sizeof(name), "STM32F103 %luK%s", kb, rdp ? " locked" : "");
-  else snprintf(name, sizeof(name), "dev %03lX %luK%s", dev, kb, rdp ? " locked" : "");
+  flashBytes = kb * 1024;
+  bool f103 = dev == 0x410 || dev == 0x412;   // medium / low density: 1 KB pages
+  bool rdp = obr & OBR_RDPRT;
+  refusal = !f103 ? "unsupported" : rdp ? "locked" : nullptr;
+  if (f103) snprintf(name, sizeof(name), "STM32F103 %luK%s", kb, rdp ? " locked" : "");
+  else snprintf(name, sizeof(name), "dev %03lX %luK", dev, kb);
   return name;
 }
 
-bool stm32_locked() { return rdp; }
+const char *stm32_refusal() { return refusal; }
+size_t stm32_flash_size() { return flashBytes; }
 
 // No NRST on the Bluepill's SWD header, so reset via SYSRESETREQ with
 // reset vector catch: the core halts before the old firmware runs a single
